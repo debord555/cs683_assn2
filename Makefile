@@ -1,3 +1,6 @@
+CC := gcc-7
+CXX := g++-7
+
 app = champsim
 
 srcExt = cc

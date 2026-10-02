@@ -1,0 +1,9 @@
+services:
+  ubuntu1804:
+    build: .
+    container_name: ubuntu1804-gcc7
+    volumes:
+      - ${HOME}:/mnt
+    stdin_open: true
+    tty: true
+    command: /bin/bash
