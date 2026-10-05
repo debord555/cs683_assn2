@@ -1,0 +1,113 @@
+// I-RRIP: Instruction-conscious RRIP for the L2 cache (CS683 PA2, Task 2A)
+//
+// Built on SRRIP (replacement/rrip.l2c_repl). Every line has a 2-bit RRPV
+// (Re-Reference Prediction Value): 0 = expected to be re-used very soon,
+// 3 = not expected soon (evicted first).
+//
+// I-RRIP gives instruction lines (program code) priority over data lines
+// in all three parts of the policy:
+//   insertion : a new instruction line starts at a lower (safer) RRPV
+//   promotion : a hit takes an instruction line lower than a data line
+//   eviction  : among lines at max RRPV, data lines are evicted first
+#include "cache.h"
+
+#define maxRRPV 3
+
+// Tunable settings (RRPV values) - varied in the experiments
+#define INSTR_INSERT_RRPV 1   // new instruction line   (SRRIP uses 2)
+#define DATA_INSERT_RRPV  2   // new data line          (same as SRRIP)
+#define INSTR_HIT_RRPV    0   // instruction line hit   (same as SRRIP)
+#define DATA_HIT_RRPV     1   // data line hit          (SRRIP uses 0)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// Statistics for the report, counted after warmup. Index 0 = data, 1 = instruction.
+uint64_t irrip_inserts[2], irrip_evicts[2];
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+    irrip_inserts[0] = irrip_inserts[1] = 0;
+    irrip_evicts[0] = irrip_evicts[1] = 0;
+}
+
+// find replacement victim (EVICTION)
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // 1. An empty slot needs no eviction
+    for (int i=0; i<L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    while (1)
+    {
+        // 2. Prefer a DATA line that is not expected to be re-used soon.
+        //    current_set[i].instruction is set by fill_cache() for L2 lines.
+        for (int i=0; i<L2C_WAY; i++)
+            if ((l2_rrpv[set][i] == maxRRPV) && !current_set[i].instruction) {
+                if (warmup_complete[cpu])
+                    irrip_evicts[0]++;
+                return i;
+            }
+
+        // 3. Only if there is no such data line, evict an INSTRUCTION line
+        for (int i=0; i<L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (warmup_complete[cpu])
+                    irrip_evicts[1]++;
+                return i;
+            }
+
+        // 4. Nobody is at max RRPV: age every line and look again
+        for (int i=0; i<L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill (INSERTION and PROMOTION)
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    if (hit) {
+        // PROMOTION
+        // A writeback hit is L1D pushing modified data down, not a re-use
+        // by the program, so it does not make the line safer.
+        if (type == WRITEBACK)
+            return;
+
+        // Re-used code goes to 0, re-used data only to 1, so code stays ahead.
+        // Never raise an RRPV on a hit (e.g. a data access hitting a code line).
+        uint32_t target = isInstruction ? INSTR_HIT_RRPV : DATA_HIT_RRPV;
+        if (target < l2_rrpv[set][way])
+            l2_rrpv[set][way] = target;
+    }
+    else {
+        // INSERTION
+        // New code starts safer than new data.
+        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+        if (warmup_complete[cpu])
+            irrip_inserts[isInstruction ? 1 : 0]++;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "L2C I-RRIP instruction lines inserted: " << irrip_inserts[1] << endl;
+    cout << "L2C I-RRIP data lines inserted: " << irrip_inserts[0] << endl;
+    cout << "L2C I-RRIP instruction lines evicted: " << irrip_evicts[1] << endl;
+    cout << "L2C I-RRIP data lines evicted: " << irrip_evicts[0] << endl;
+}
