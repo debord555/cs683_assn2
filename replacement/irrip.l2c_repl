@@ -10,14 +10,41 @@
 //   promotion : a hit takes an instruction line lower than a data line
 //   eviction  : among lines at max RRPV, data lines are evicted first
 #include "cache.h"
+#include <cstdlib>   // getenv(), atoi()
 
 #define maxRRPV 3
 
-// Tunable settings (RRPV values) - varied in the experiments
+// Default settings = the I-RRIP design (RRPV values)
 #define INSTR_INSERT_RRPV 1   // new instruction line   (SRRIP uses 2)
 #define DATA_INSERT_RRPV  2   // new data line          (same as SRRIP)
 #define INSTR_HIT_RRPV    0   // instruction line hit   (same as SRRIP)
 #define DATA_HIT_RRPV     1   // data line hit          (SRRIP uses 0)
+#define DATA_FIRST_EVICT  1   // 1 = evict data lines before instruction lines
+
+// Active settings. They start as the defaults above and can be overridden
+// when the simulator starts, through environment variables (see
+// l2c_initialize_replacement). This lets the experiments test variants of
+// I-RRIP with one binary, e.g.  IRRIP_DATA_HIT=0 ./bin/...-irrip ...
+uint32_t irrip_instr_insert = INSTR_INSERT_RRPV;
+uint32_t irrip_data_insert  = DATA_INSERT_RRPV;
+uint32_t irrip_instr_hit    = INSTR_HIT_RRPV;
+uint32_t irrip_data_hit     = DATA_HIT_RRPV;
+uint32_t irrip_data_first   = DATA_FIRST_EVICT;
+
+// Read one setting from the environment; keep the default if it is not set.
+// Stops the simulation if the value is outside 0..max (a typo in a script).
+static uint32_t env_setting(const char *name, uint32_t def, uint32_t max)
+{
+    const char *value = getenv(name);
+    if (value == NULL)
+        return def;
+    int x = atoi(value);
+    if (x < 0 || (uint32_t)x > max) {
+        cerr << "I-RRIP: " << name << "=" << value << " must be 0.." << max << endl;
+        assert(0);
+    }
+    return (uint32_t)x;
+}
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
@@ -28,6 +55,18 @@ uint64_t irrip_inserts[2], irrip_evicts[2];
 void CACHE::l2c_initialize_replacement()
 {
     cout << "Initialize I-RRIP state for L2C" << endl;
+
+    // Optional overrides for the experiments (defaults = I-RRIP design)
+    irrip_instr_insert = env_setting("IRRIP_INSTR_INSERT", INSTR_INSERT_RRPV, maxRRPV);
+    irrip_data_insert  = env_setting("IRRIP_DATA_INSERT",  DATA_INSERT_RRPV,  maxRRPV);
+    irrip_instr_hit    = env_setting("IRRIP_INSTR_HIT",    INSTR_HIT_RRPV,    maxRRPV);
+    irrip_data_hit     = env_setting("IRRIP_DATA_HIT",     DATA_HIT_RRPV,     maxRRPV);
+    irrip_data_first   = env_setting("IRRIP_DATA_FIRST",   DATA_FIRST_EVICT,  1);
+    cout << "I-RRIP settings: instr_insert=" << irrip_instr_insert
+         << " data_insert=" << irrip_data_insert
+         << " instr_hit=" << irrip_instr_hit
+         << " data_hit=" << irrip_data_hit
+         << " data_first=" << irrip_data_first << endl;
 
     for (int i=0; i<L2C_SET; i++) {
         for (int j=0; j<L2C_WAY; j++) {
@@ -50,18 +89,20 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     {
         // 2. Prefer a DATA line that is not expected to be re-used soon.
         //    current_set[i].instruction is set by fill_cache() for L2 lines.
-        for (int i=0; i<L2C_WAY; i++)
+        //    (Skipped when the data-first rule is switched off.)
+        for (int i=0; i<L2C_WAY && irrip_data_first; i++)
             if ((l2_rrpv[set][i] == maxRRPV) && !current_set[i].instruction) {
                 if (warmup_complete[cpu])
                     irrip_evicts[0]++;
                 return i;
             }
 
-        // 3. Only if there is no such data line, evict an INSTRUCTION line
+        // 3. Otherwise evict the first line at max RRPV (an instruction line when
+        //    data-first is on; code or data when it is off)
         for (int i=0; i<L2C_WAY; i++)
             if (l2_rrpv[set][i] == maxRRPV) {
                 if (warmup_complete[cpu])
-                    irrip_evicts[1]++;
+                    irrip_evicts[current_set[i].instruction ? 1 : 0]++;
                 return i;
             }
 
@@ -90,14 +131,14 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
         // Re-used code goes to 0, re-used data only to 1, so code stays ahead.
         // Never raise an RRPV on a hit (e.g. a data access hitting a code line).
-        uint32_t target = isInstruction ? INSTR_HIT_RRPV : DATA_HIT_RRPV;
+        uint32_t target = isInstruction ? irrip_instr_hit : irrip_data_hit;
         if (target < l2_rrpv[set][way])
             l2_rrpv[set][way] = target;
     }
     else {
         // INSERTION
         // New code starts safer than new data.
-        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+        l2_rrpv[set][way] = isInstruction ? irrip_instr_insert : irrip_data_insert;
         if (warmup_complete[cpu])
             irrip_inserts[isInstruction ? 1 : 0]++;
     }
