@@ -1,0 +1,300 @@
+////////////////////////////////////////////////////////////////////////////////
+// Dynamic I-RRIP for the L2 cache (CS683 PA2, Task 2B)
+//
+// Problem with plain I-RRIP (Task 2A): it ALWAYS favours instruction lines.
+// When a phase of the program has a small code footprint and a large data
+// working set, protecting code only pushes useful data out (in our Task 2A
+// runs, Trace1 data MPKI rose from 7.08 with SRRIP to 7.88 with I-RRIP).
+//
+// Fix: decide at run time, with SET DUELING, whether protecting instructions
+// is worth it right now.
+//
+//   * LEADER sets (a small sample, default 32 of the 1024 sets) ALWAYS run
+//     plain SRRIP, exactly like replacement/rrip.l2c_repl. Because they ignore
+//     the instruction flag, they show the "natural" mix of instruction and data
+//     traffic the program creates, unbiased by our own policy.
+//   * In the leader sets we count accesses and misses, split into instruction
+//     and non-instruction (data, RFO, translation) lines.
+//   * Every EPOCH leader accesses we compute the instruction pressure
+//
+//          ratio = (instr accesses + instr misses) / (total accesses + total misses)
+//
+//     (the formula from the assignment hint). Accesses say how much the
+//     program uses code at L2; misses add weight when that code also misses,
+//     i.e. when there is something for I-RRIP to save.
+//   * FOLLOWER sets (all other sets) use I-RRIP while ratio > THRESHOLD and
+//     plain SRRIP otherwise.
+//   * After each decision the counters are halved (exponential decay), so the
+//     decision follows program phases instead of the whole run's average.
+//
+// Tunable parameters (environment variables read at start-up, so one binary
+// can be used for the whole sensitivity study, same idea as Task 2A):
+//     DYN_THRESHOLD   decision threshold, 0.0 .. 1.0         (default 0.25)
+//     DYN_LEADERS     number of SRRIP leader sets, power of 2 (default 32)
+//     DYN_EPOCH       leader accesses between two decisions   (default 1024)
+//   e.g.  DYN_THRESHOLD=0.35 ./bin/...-dyn_irrip -warmup_instructions ...
+////////////////////////////////////////////////////////////////////////////////
+#include "cache.h"
+#include <cstdlib>   // getenv(), atoi(), atof()
+
+#define maxRRPV 3
+
+// ---------------- RRPV values used by the two modes ----------------
+// SRRIP mode (leader sets always, follower sets when ratio <= threshold):
+// identical to replacement/rrip.l2c_repl
+#define SRRIP_INSERT_RRPV   2   // every new line
+#define SRRIP_HIT_RRPV      0   // every hit
+
+// I-RRIP mode (follower sets when ratio > threshold):
+// identical to the Task 2A design in replacement/irrip.l2c_repl
+#define INSTR_INSERT_RRPV   1   // new instruction line starts safer
+#define DATA_INSERT_RRPV    2   // new data line, as SRRIP
+#define INSTR_HIT_RRPV      0   // re-used code goes to "re-use very soon"
+#define DATA_HIT_RRPV       1   // re-used data only to 1, so code stays ahead
+//                             + eviction prefers data lines at maxRRPV
+
+// ---------------- default dueling parameters ----------------
+#define DEFAULT_THRESHOLD   0.25
+#define DEFAULT_LEADERS     32
+#define DEFAULT_EPOCH       1024
+
+// Active parameters (defaults, overridable through the environment)
+double   dyn_threshold = DEFAULT_THRESHOLD;
+uint32_t dyn_leaders   = DEFAULT_LEADERS;
+uint32_t dyn_epoch     = DEFAULT_EPOCH;
+
+// Per-line state: 2-bit RRPV, as in SRRIP
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// is_leader[s] = 1 if set s always runs SRRIP and feeds the counters
+uint8_t is_leader[L2C_SET];
+
+// Global mode chosen for the follower sets: 1 = I-RRIP, 0 = SRRIP
+uint8_t irrip_mode = 1;
+
+// Dueling counters, updated ONLY by accesses to leader sets.
+// Halved after every decision (decay), so they describe the recent past.
+uint64_t ld_instr_access, ld_instr_miss;   // instruction lines
+uint64_t ld_total_access, ld_total_miss;   // all lines (instruction + rest)
+uint32_t ld_epoch_count;                   // leader accesses in this epoch
+double   last_ratio = 0.0;                 // value of the last decision
+
+// Statistics for the report (counted after warmup only)
+uint64_t st_decisions, st_decisions_irrip;      // epochs and epochs in I-RRIP mode
+uint64_t st_switches;                           // how often the mode changed
+uint64_t st_follower_access[2];                 // follower accesses in [SRRIP, I-RRIP] mode
+uint64_t st_inserts[2], st_evicts[2];           // [data, instruction] lines
+double   st_ratio_sum;                          // to report the average ratio
+
+// ------------------------------------------------------------------
+// Read one parameter from the environment, keep the default if unset.
+// ------------------------------------------------------------------
+static double env_double(const char *name, double def)
+{
+    const char *value = getenv(name);
+    return value ? atof(value) : def;
+}
+
+static uint32_t env_uint(const char *name, uint32_t def)
+{
+    const char *value = getenv(name);
+    return value ? (uint32_t)atoi(value) : def;
+}
+
+// ------------------------------------------------------------------
+// Make the decision at the end of an epoch.
+// ------------------------------------------------------------------
+static void dyn_decide(uint32_t cpu)
+{
+    uint64_t denominator = ld_total_access + ld_total_miss;
+    if (denominator == 0)                 // nothing observed: keep the mode
+        return;
+
+    // Instruction pressure seen by the (unbiased) SRRIP leader sets
+    last_ratio = (double)(ld_instr_access + ld_instr_miss) / (double)denominator;
+
+    uint8_t new_mode = (last_ratio > dyn_threshold) ? 1 : 0;
+
+    if (warmup_complete[cpu]) {
+        st_decisions++;
+        st_decisions_irrip += new_mode;
+        st_switches += (new_mode != irrip_mode);
+        st_ratio_sum += last_ratio;
+    }
+    irrip_mode = new_mode;
+
+    // Exponential decay: old behaviour still counts, but only half as much
+    // after every epoch, so a phase change is noticed within a few epochs.
+    ld_instr_access >>= 1;
+    ld_instr_miss   >>= 1;
+    ld_total_access >>= 1;
+    ld_total_miss   >>= 1;
+    ld_epoch_count = 0;
+}
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C" << endl;
+
+    dyn_threshold = env_double("DYN_THRESHOLD", DEFAULT_THRESHOLD);
+    dyn_leaders   = env_uint("DYN_LEADERS", DEFAULT_LEADERS);
+    dyn_epoch     = env_uint("DYN_EPOCH", DEFAULT_EPOCH);
+
+    // Leaders must split the sets evenly: power of two, at least 1,
+    // at most half the sets (otherwise there are hardly any followers left).
+    if (dyn_leaders == 0 || (dyn_leaders & (dyn_leaders - 1)) || dyn_leaders > L2C_SET / 2) {
+        cerr << "Dynamic I-RRIP: DYN_LEADERS=" << dyn_leaders
+             << " must be a power of two between 1 and " << L2C_SET / 2 << endl;
+        assert(0);
+    }
+    if (dyn_threshold < 0.0 || dyn_threshold > 1.0 || dyn_epoch == 0) {
+        cerr << "Dynamic I-RRIP: DYN_THRESHOLD must be 0..1 and DYN_EPOCH > 0" << endl;
+        assert(0);
+    }
+    cout << "Dynamic I-RRIP settings: threshold=" << dyn_threshold
+         << " leaders=" << dyn_leaders << " epoch=" << dyn_epoch << endl;
+
+    // Choose leader sets spread over the whole cache.
+    // The cache is cut into dyn_leaders regions of `stride` sets each; region k
+    // contributes set  k*stride + (k % stride). Shifting the offset per region
+    // (instead of always taking the first set of each region) avoids picking
+    // only sets whose index bits look alike, which could all map to the same
+    // kind of address (e.g. the start of every page).
+    uint32_t stride = L2C_SET / dyn_leaders;
+    for (uint32_t s = 0; s < L2C_SET; s++)
+        is_leader[s] = ((s % stride) == ((s / stride) % stride)) ? 1 : 0;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
+
+    // Start in I-RRIP mode (it won on average in Task 2A); the first
+    // decision comes after one epoch, long before the warmup ends.
+    irrip_mode = 1;
+    ld_instr_access = ld_instr_miss = ld_total_access = ld_total_miss = 0;
+    ld_epoch_count = 0;
+    st_decisions = st_decisions_irrip = st_switches = 0;
+    st_follower_access[0] = st_follower_access[1] = 0;
+    st_inserts[0] = st_inserts[1] = st_evicts[0] = st_evicts[1] = 0;
+    st_ratio_sum = 0.0;
+}
+
+// find replacement victim (EVICTION)
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // 1. An empty slot needs no eviction
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    // Leader sets always behave like SRRIP; followers follow the global mode
+    bool use_irrip = !is_leader[set] && irrip_mode;
+
+    while (1)
+    {
+        // 2. I-RRIP only: prefer a DATA line that is not expected to be re-used.
+        //    current_set[i].instruction is set by fill_cache() for L2 lines.
+        if (use_irrip)
+            for (int i = 0; i < L2C_WAY; i++)
+                if ((l2_rrpv[set][i] == maxRRPV) && !current_set[i].instruction) {
+                    if (warmup_complete[cpu])
+                        st_evicts[0]++;
+                    return i;
+                }
+
+        // 3. Both modes: the first line at maxRRPV (plain SRRIP rule)
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (warmup_complete[cpu])
+                    st_evicts[current_set[i].instruction ? 1 : 0]++;
+                return i;
+            }
+
+        // 4. Nobody at maxRRPV: age every line and look again
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill (INSERTION and PROMOTION)
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // ---------------- LEADER SET: train the counters, run SRRIP ----------------
+    if (is_leader[set]) {
+        // A writeback is L1D pushing dirty data down, not a demand by the
+        // program, so it says nothing about instruction vs data pressure.
+        if (type != WRITEBACK) {
+            ld_total_access++;
+            if (!hit)
+                ld_total_miss++;            // hit == 0 means this call is a fill after a miss
+            if (isInstruction) {
+                ld_instr_access++;
+                if (!hit)
+                    ld_instr_miss++;
+            }
+            if (++ld_epoch_count >= dyn_epoch)
+                dyn_decide(cpu);
+        }
+
+        // Plain SRRIP, exactly as replacement/rrip.l2c_repl
+        l2_rrpv[set][way] = hit ? SRRIP_HIT_RRPV : SRRIP_INSERT_RRPV;
+        return;
+    }
+
+    // ---------------- FOLLOWER SET: use the chosen mode ----------------
+    if (warmup_complete[cpu] && type != WRITEBACK)
+        st_follower_access[irrip_mode]++;
+
+    if (!irrip_mode) {
+        // SRRIP mode: ignore the instruction flag
+        l2_rrpv[set][way] = hit ? SRRIP_HIT_RRPV : SRRIP_INSERT_RRPV;
+        if (!hit && warmup_complete[cpu])
+            st_inserts[isInstruction ? 1 : 0]++;
+        return;
+    }
+
+    // I-RRIP mode: same rules as Task 2A
+    if (hit) {
+        // PROMOTION. A writeback hit is not a re-use by the program.
+        if (type == WRITEBACK)
+            return;
+        // Code to 0, data only to 1; never raise an RRPV on a hit.
+        uint32_t target = isInstruction ? INSTR_HIT_RRPV : DATA_HIT_RRPV;
+        if (target < l2_rrpv[set][way])
+            l2_rrpv[set][way] = target;
+    }
+    else {
+        // INSERTION: new code starts safer than new data
+        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+        if (warmup_complete[cpu])
+            st_inserts[isInstruction ? 1 : 0]++;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t follower_total = st_follower_access[0] + st_follower_access[1];
+    cout << "L2C DYN-IRRIP threshold: " << dyn_threshold << endl;
+    cout << "L2C DYN-IRRIP leader sets: " << dyn_leaders << endl;
+    cout << "L2C DYN-IRRIP epoch: " << dyn_epoch << endl;
+    cout << "L2C DYN-IRRIP decisions: " << st_decisions << endl;
+    cout << "L2C DYN-IRRIP decisions in I-RRIP mode: " << st_decisions_irrip << endl;
+    cout << "L2C DYN-IRRIP mode switches: " << st_switches << endl;
+    cout << "L2C DYN-IRRIP average ratio: "
+         << (st_decisions ? st_ratio_sum / st_decisions : 0.0) << endl;
+    cout << "L2C DYN-IRRIP follower accesses in I-RRIP mode %: "
+         << (follower_total ? 100.0 * st_follower_access[1] / follower_total : 0.0) << endl;
+    cout << "L2C DYN-IRRIP instruction lines inserted (followers): " << st_inserts[1] << endl;
+    cout << "L2C DYN-IRRIP data lines inserted (followers): " << st_inserts[0] << endl;
+    cout << "L2C DYN-IRRIP instruction lines evicted: " << st_evicts[1] << endl;
+    cout << "L2C DYN-IRRIP data lines evicted: " << st_evicts[0] << endl;
+}
