@@ -1,5 +1,58 @@
 #include "cache.h"
+#include <unordered_map>
+#include <vector>
 
+#define NUM_IP_ENTRIES 24
+#define NUM_PATTERNS 24
+#define HISTORY_LEN 8
+typedef uint64_t ip_t;
+
+struct Vector_Hash{
+    size_t operator()(const vector<int64_t> &vec) const {
+        size_t h = vec.size();
+        for(int64_t x:vec)
+            h ^= std::hash<int64_t>{}(x)  + 0x9e3779b9 + (h<<6) +(h>>2);
+        return h;
+    }
+};
+
+struct IP_P_Entry{
+    int64_t next_stride;
+    int64_t confidence;
+};
+
+struct IP_Entry{
+    uint64_t last_addr;
+    vector <int64_t> last_strides;
+    uint8_t confidence;
+    uint8_t LRU;
+    int64_t modified_stride;
+
+
+    unordered_map <vector<int64_t>, IP_P_Entry, Vector_Hash> patterns;
+
+    IP_Entry(uint64_t addr){
+        last_strides.assign(HISTORY_LEN,0);
+        this-> LRU = 0;
+        this-> confidence = 0;
+        this-> modified_stride=0;
+        this-> last_addr = addr;
+    }
+};
+
+unordered_map<ip_t,IP_Entry> IP_Table;
+
+void evict_lru_ip(){
+    if (IP_Table.size() < NUM_IP_ENTRIES)
+        return;
+
+    auto victim = IP_Table.begin();
+    for (auto it = IP_Table.begin(); it != IP_Table.end(); ++it) {
+        if (it->second.LRU > victim->second.LRU)
+            victim = it;
+    }
+    IP_Table.erase(victim);
+}
 
 void CACHE::l1d_prefetcher_initialize() 
 {
@@ -10,7 +63,24 @@ void CACHE::l1d_prefetcher_initialize()
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+   uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+   auto it=IP_Table.find(ip);
+   if(it == IP_Table.end()){
+    evict_lru_ip();
+    IP_Table.emplace(ip,IP_Entry(cl_addr));
+   }
+   else{
+    IP_Entry &entry = it->second;
+    int64_t stride = (int64_t)cl_addr - (int64_t)entry.last_addr;
+
+    if (stride == entry.last_strides.back() && entry.confidence < UINT8_MAX)
+        entry.confidence++;
+
+    entry.last_strides.erase(entry.last_strides.begin());
+    entry.last_strides.push_back(stride);
+    entry.last_addr = cl_addr;
+   }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
