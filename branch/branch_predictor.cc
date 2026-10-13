@@ -173,6 +173,7 @@ uint8_t O3_CPU::predict_branch(uint64_t pc) {
 	return yout[cpu] >= 1;
 }
 
+
 void O3_CPU::last_branch_result(uint64_t pc, uint8_t taken) {
 
 	// was this prediction correct?
