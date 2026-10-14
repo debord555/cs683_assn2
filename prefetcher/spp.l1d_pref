@@ -10,9 +10,9 @@
 #define MID_CONF 1
 #define HIGH_CONF 2
 
-#define ACC_HIGH 0.75
-#define ACC_LOW 0.5
-#define MAX_DEGREE 4
+#define ACC_HIGH 0.6
+#define ACC_LOW 0.3
+#define MAX_DEGREE 8
 #define MIN_DEGREE 1
 #define EPOCH_LEN 256
 #define MASK_IP 0xFF
@@ -188,7 +188,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                 entry.confidence--;
             entry.last_strides.assign(HISTORY_LEN, 0);
             entry.last_addr = cl_addr;
-            adjust_prefetch_degree(pf_issued, pf_useful);
+            adjust_prefetch_degree(pf_lower_level, pf_useful);
             return;
         }
 
@@ -224,7 +224,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         entry.last_strides.erase(entry.last_strides.begin());
         entry.last_strides.push_back((stride_t)stride);
         entry.last_addr = cl_addr;
-        adjust_prefetch_degree(pf_issued, pf_useful);
+        adjust_prefetch_degree(pf_lower_level, pf_useful);
 
         if (it->second.confidence == HIGH_CONF) {
             // Prefetch using the constant stride data
