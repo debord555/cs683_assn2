@@ -15,24 +15,29 @@
 #define MAX_DEGREE 4
 #define MIN_DEGREE 1
 #define EPOCH_LEN 256
+#define MASK_IP 0xFF
 
-typedef uint64_t ip_t;
+// only the low 8 bits of the IP are stored (see MASK_IP)
+typedef uint8_t ip_t;
+
+// strides are stored in cache lines; only strides in [-128, 127] are tracked
+typedef int8_t stride_t;
 
 struct Vector_Hash {
-    size_t operator()(const vector<int64_t> &vec) const {
+    size_t operator()(const vector<stride_t> &vec) const {
         size_t h = vec.size();
-        for (int64_t x : vec)
-            h ^= std::hash<int64_t>{}(x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        for (stride_t x : vec)
+            h ^= std::hash<stride_t>{}(x) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
 
 struct IP_P_Entry {
-    int64_t next_stride;
+    stride_t next_stride;
     int8_t confidence;
     uint8_t LRU;
 
-    IP_P_Entry(int64_t stride) {
+    IP_P_Entry(stride_t stride) {
         next_stride = stride;
         confidence = 0;
         LRU = 0;
@@ -41,12 +46,12 @@ struct IP_P_Entry {
 
 struct IP_Entry {
     uint64_t last_addr;
-    vector<int64_t> last_strides;
+    vector<stride_t> last_strides;
     uint8_t confidence;
     uint8_t LRU;
-    int64_t monitored_stride;
+    stride_t monitored_stride;
 
-    unordered_map<vector<int64_t>, IP_P_Entry, Vector_Hash> patterns;
+    unordered_map<vector<stride_t>, IP_P_Entry, Vector_Hash> patterns;
 
     IP_Entry(uint64_t addr) {
         last_strides.assign(HISTORY_LEN, 0);
@@ -119,13 +124,13 @@ void adjust_prefetch_degree(uint64_t pf_issued, uint64_t pf_useful) {
 }
 
 vector<uint64_t> find_prefetch_targets(IP_Entry &entry, uint64_t cl_addr, int degree) {
-    vector<int64_t> strides = entry.last_strides;
+    vector<stride_t> strides = entry.last_strides;
     vector<uint64_t> result;
     for (int i = 0; i < degree; i++) {
         auto it = entry.patterns.find(strides);
         if (it == entry.patterns.end())
             break;
-        int64_t nxt = it->second.next_stride;
+        stride_t nxt = it->second.next_stride;
         strides.erase(strides.begin());
         strides.push_back(nxt);
         result.push_back(cl_addr += nxt);
@@ -144,7 +149,7 @@ void increase_ip_lru(unordered_map<ip_t, IP_Entry>::iterator except) {
     }
 }
 
-void increase_pattern_lru(IP_Entry &entry, unordered_map<vector<int64_t>, IP_P_Entry, Vector_Hash>::iterator except) {
+void increase_pattern_lru(IP_Entry &entry, unordered_map<vector<stride_t>, IP_P_Entry, Vector_Hash>::iterator except) {
     for (auto it = entry.patterns.begin(); it != entry.patterns.end(); it++) {
         if (it != except) {
             if (it->second.LRU != UINT8_MAX)
@@ -162,11 +167,12 @@ void CACHE::l1d_prefetcher_initialize() {
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    ip_t masked_ip = ip & MASK_IP;
 
-    auto it = g_ip_table.find(ip);
+    auto it = g_ip_table.find(masked_ip);
     if (it == g_ip_table.end()) {
         evict_lru_ip();
-        g_ip_table.emplace(ip, IP_Entry(cl_addr));
+        g_ip_table.emplace(masked_ip, IP_Entry(cl_addr));
     } else {
         IP_Entry &entry = it->second;
         int64_t stride = calculate_stride(cl_addr, entry.last_addr);
@@ -175,6 +181,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             return;
         increase_ip_lru(it);
 
+        // Strides that don't fit in a stride_t can't be stored: count it as a
+        // constant stride mismatch, restart the stride history and skip prefetching
+        if (stride < INT8_MIN || stride > INT8_MAX) {
+            if (entry.confidence > NO_CONF)
+                entry.confidence--;
+            entry.last_strides.assign(HISTORY_LEN, 0);
+            entry.last_addr = cl_addr;
+            adjust_prefetch_degree(pf_issued, pf_useful);
+            return;
+        }
+
         // Train the constant stride prefetcher
         if (stride == entry.monitored_stride) {
             if (entry.confidence < HIGH_CONF)
@@ -182,13 +199,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         } else if (entry.confidence > NO_CONF)
             entry.confidence--;
         else
-            entry.monitored_stride = stride;
+            entry.monitored_stride = (stride_t)stride;
 
         // Train the variable stride prefetcher
         auto itp = entry.patterns.find(entry.last_strides);
         if (itp == entry.patterns.end()) {
             evict_least_confident_pattern(entry);
-            entry.patterns.emplace(entry.last_strides, IP_P_Entry(stride));
+            entry.patterns.emplace(entry.last_strides, IP_P_Entry((stride_t)stride));
         } else {
             increase_pattern_lru(entry, itp);
             if (itp->second.next_stride == stride) {
@@ -199,13 +216,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
                     itp->second.confidence = itp->second.confidence / 2;
                 else {
                     itp->second.confidence = 0;
-                    itp->second.next_stride = stride;
+                    itp->second.next_stride = (stride_t)stride;
                 }
             }
         }
 
         entry.last_strides.erase(entry.last_strides.begin());
-        entry.last_strides.push_back(stride);
+        entry.last_strides.push_back((stride_t)stride);
         entry.last_addr = cl_addr;
         adjust_prefetch_degree(pf_issued, pf_useful);
 
