@@ -1,3 +1,4 @@
+////////////////////////////////////////////////////////////////////////////////
 // I-RRIP: Instruction-conscious RRIP for the L2 cache (CS683 PA2, Task 2A)
 //
 // Built on SRRIP (replacement/rrip.l2c_repl). Every line has a 2-bit RRPV
@@ -9,6 +10,7 @@
 //   insertion : a new instruction line starts at a lower (safer) RRPV
 //   promotion : a hit takes an instruction line lower than a data line
 //   eviction  : among lines at max RRPV, data lines are evicted first
+////////////////////////////////////////////////////////////////////////////////
 #include "cache.h"
 #include <cstdlib>   // getenv(), atoi()
 

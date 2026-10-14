@@ -25,6 +25,11 @@ PATTERNS = {
     "data_inserted":  r"^L2C I-RRIP data lines inserted: (\d+)",
     "instr_evicted":  r"^L2C I-RRIP instruction lines evicted: (\d+)",
     "data_evicted":   r"^L2C I-RRIP data lines evicted: (\d+)",
+    # Dynamic I-RRIP (Task 2B) statistics
+    "dyn_decisions":  r"^L2C DYN-IRRIP decisions: (\d+)",
+    "dyn_switches":   r"^L2C DYN-IRRIP mode switches: (\d+)",
+    "dyn_avg_ratio":  r"^L2C DYN-IRRIP average ratio: ([\d.e+-]+)",
+    "dyn_irrip_pct":  r"^L2C DYN-IRRIP follower accesses in I-RRIP mode %: ([\d.e+-]+)",
 }
 COLUMNS = ["config", "trace", "ipc", "speedup"] + [k for k in PATTERNS if k != "ipc"]
 
