@@ -11,9 +11,10 @@
 #define HIGH_CONF 2
 
 #define ACC_HIGH 0.75
-#define ACC_LOW 0.25
+#define ACC_LOW 0.5
 #define MAX_DEGREE 4
 #define MIN_DEGREE 1
+#define EPOCH_LEN 256
 
 typedef uint64_t ip_t;
 
@@ -28,11 +29,13 @@ struct Vector_Hash {
 
 struct IP_P_Entry {
     int64_t next_stride;
-    int64_t confidence;
+    int8_t confidence;
+    uint8_t LRU;
 
     IP_P_Entry(int64_t stride) {
         next_stride = stride;
         confidence = 0;
+        LRU = 0;
     }
 };
 
@@ -56,7 +59,7 @@ struct IP_Entry {
 
 unordered_map<ip_t, IP_Entry> g_ip_table;
 int g_prefetch_degree = 1;
-uint64_t epoch_accesses = 0;
+uint64_t g_epoch_accesses = 0;
 uint64_t g_last_issued = 0, g_last_useful = 0;
 
 void evict_lru_ip() {
@@ -77,11 +80,11 @@ void evict_least_confident_pattern(IP_Entry &entry) {
         return;
 
     auto it = the_map.begin();
-    int64_t min_confidence = INT64_MAX;
+    int64_t min_score = INT64_MAX;
     auto to_delete = it;
     for (; it != the_map.end(); it++) {
-        if (it->second.confidence < min_confidence) {
-            min_confidence = it->second.confidence;
+        if (it->second.confidence - it->second.LRU < min_score) {
+            min_score = it->second.confidence - it->second.LRU;
             to_delete = it;
         }
     }
@@ -96,6 +99,10 @@ int64_t calculate_stride(uint64_t curr_addr, uint64_t last_addr) {
 }
 
 void adjust_prefetch_degree(uint64_t pf_issued, uint64_t pf_useful) {
+    if (++g_epoch_accesses < EPOCH_LEN)
+        return;
+    g_epoch_accesses = 0;
+
     uint64_t issued = pf_issued - g_last_issued;
     uint64_t useful = pf_useful - g_last_useful;
     g_last_issued = pf_issued;
@@ -105,7 +112,7 @@ void adjust_prefetch_degree(uint64_t pf_issued, uint64_t pf_useful) {
         return; // nothing to judge this epoch
 
     double accuracy = (double)useful / issued;
-    if (accuracy > ACC_HIGH && prefetch_degree < MAX_DEGREE)
+    if (accuracy > ACC_HIGH && g_prefetch_degree < MAX_DEGREE)
         g_prefetch_degree++;
     else if (accuracy < ACC_LOW && g_prefetch_degree > MIN_DEGREE)
         g_prefetch_degree--;
@@ -113,8 +120,37 @@ void adjust_prefetch_degree(uint64_t pf_issued, uint64_t pf_useful) {
 
 vector<uint64_t> find_prefetch_targets(IP_Entry &entry, uint64_t cl_addr, int degree) {
     vector<int64_t> strides = entry.last_strides;
+    vector<uint64_t> result;
     for (int i = 0; i < degree; i++) {
-        // TODO
+        auto it = entry.patterns.find(strides);
+        if (it == entry.patterns.end())
+            break;
+        int64_t nxt = it->second.next_stride;
+        strides.erase(strides.begin());
+        strides.push_back(nxt);
+        result.push_back(cl_addr += nxt);
+    }
+    return result;
+}
+
+void increase_ip_lru(unordered_map<ip_t, IP_Entry>::iterator except) {
+    for (auto it = g_ip_table.begin(); it != g_ip_table.end(); it++) {
+        if (it != except) {
+            if (it->second.LRU != UINT8_MAX)
+                it->second.LRU++;
+        } else {
+            it->second.LRU = 0;
+        }
+    }
+}
+
+void increase_pattern_lru(IP_Entry &entry, unordered_map<vector<int64_t>, IP_P_Entry, Vector_Hash>::iterator except) {
+    for (auto it = entry.patterns.begin(); it != entry.patterns.end(); it++) {
+        if (it != except) {
+            if (it->second.LRU != UINT8_MAX)
+                it->second.LRU++;
+        } else
+            it->second.LRU = 0;
     }
 }
 
@@ -135,12 +171,17 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         IP_Entry &entry = it->second;
         int64_t stride = calculate_stride(cl_addr, entry.last_addr);
 
+        if (stride == 0)
+            return;
+        increase_ip_lru(it);
+
         // Train the constant stride prefetcher
-        if (stride == entry.monitored_stride && entry.confidence < HIGH_CONF)
-            entry.confidence++;
-        else if (stride != entry.monitored_stride && entry.confidence == MID_CONF)
+        if (stride == entry.monitored_stride) {
+            if (entry.confidence < HIGH_CONF)
+                entry.confidence++;
+        } else if (entry.confidence > NO_CONF)
             entry.confidence--;
-        else if (stride != entry.monitored_stride && entry.confidence == NO_CONF)
+        else
             entry.monitored_stride = stride;
 
         // Train the variable stride prefetcher
@@ -149,10 +190,18 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             evict_least_confident_pattern(entry);
             entry.patterns.emplace(entry.last_strides, IP_P_Entry(stride));
         } else {
-            if (itp->second.next_stride == stride)
-                itp->second.confidence++;
-            else
-                itp->second.confidence--;
+            increase_pattern_lru(entry, itp);
+            if (itp->second.next_stride == stride) {
+                if (itp->second.confidence < INT8_MAX)
+                    itp->second.confidence++;
+            } else {
+                if (itp->second.confidence > 0)
+                    itp->second.confidence = itp->second.confidence / 2;
+                else {
+                    itp->second.confidence = 0;
+                    itp->second.next_stride = stride;
+                }
+            }
         }
 
         entry.last_strides.erase(entry.last_strides.begin());
@@ -162,18 +211,23 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
         if (it->second.confidence == HIGH_CONF) {
             // Prefetch using the constant stride data
-            for (int d = 1; d < g_prefetch_degree; g++) {
-                uint64_t tgt = (cl_addr + d * stride) << LOG2_BLOCK_SIZE;
+            for (int d = 1; d <= g_prefetch_degree; d++) {
+                uint64_t tgt = (cl_addr + d * entry.monitored_stride) << LOG2_BLOCK_SIZE;
                 if ((tgt >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
                     break;
-                if (MSHR.occupancy < (MSHR.SIZE >> 1))
+                if (MSHR.occupancy < MSHR.SIZE - 2)
                     prefetch_line(ip, addr, tgt, FILL_L1, 0);
-                else
-                    prefetch_line(ip, addr, tgt, FILL_L2, 0);
             }
         } else {
-            // Prefetch using variable stride data TODO
+            // Prefetch using variable stride data
             vector<uint64_t> tgts = find_prefetch_targets(entry, cl_addr, g_prefetch_degree);
+            for (auto it = tgts.begin(); it != tgts.end(); it++) {
+                uint64_t tgt = (*it) << LOG2_BLOCK_SIZE;
+                if ((tgt >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    continue;
+                if (MSHR.occupancy < MSHR.SIZE - 2)
+                    prefetch_line(ip, addr, tgt, FILL_L1, 0);
+            }
         }
     }
 }
