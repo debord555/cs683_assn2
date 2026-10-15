@@ -8,7 +8,13 @@
 \graphicspath{{../results/}}
 
 \title{CS683 Programming Assignment II\\Data Prefetching and Cache Replacement}
-\date{}
+\date{15th October, 2026}
+\author{
+      Deepjyoti Kakoti (26M0774)  \\
+      Debasish Bordoloi (26M0776) \\
+      Rahul Paul (26M2102) \\
+      Piyush Malkhede (26M2130)
+}
 
 \begin{document}
 \sloppy
@@ -19,14 +25,14 @@
 \centering
 \small
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{lp{0.28\linewidth}rrr}
+\begin{tabular}{lp{0.28\linewidth}rr}
 \toprule
-Task & Mechanism (baseline) & Avg.\ speedup & Best trace & Key metric\\
+Task & Mechanism (baseline) & Avg.\ speedup & Best trace\\
 \midrule
-1B & SPP at L1D (no PF) & 1.0024 & Trace1: 1.0042 & accuracy 50.5\% (IP-stride 35.7\%)\\
-2A & I-RRIP at L2 (LRU) & 1.0079 & Trace2: 1.0241 & Trace2 L2 instr.\ MPKI $-35.3\%$\\
-2B & Dynamic I-RRIP at L2 (LRU) & 1.0068 & Trace2: 1.0223 & Trace2 L2 instr.\ MPKI $-33.0\%$\\
-3 & SPP + PF-aware Dyn-I-RRIP (no PF) & 1.0069 & Trace2: 1.0163 & avg.\ IPC 0.2903\\
+1B & SPP at L1D (no PF) & 1.0024 & Trace1: 1.0042 \\
+2A & I-RRIP at L2 (LRU) & 1.0079 & Trace2: 1.0241 \\
+2B & Dynamic I-RRIP at L2 (LRU) & 1.0068 & Trace2: 1.0223 \\
+3 & SPP + PF-aware Dyn-I-RRIP (no PF) & 1.0069 & Trace2: 1.0163 \\
 \bottomrule
 \end{tabular}
 \caption{Headline results (baseline in parentheses; PF = L1D prefetching).
@@ -1047,8 +1053,7 @@ Demand hit on a prefetched line & -- & promoted as usual (code 0 / data 1 or 0)\
 \end{table}
 
 The rules only use the request type that the cache already passes to
-\texttt{update\_replacement\_state()}, so they need \textbf{no extra storage}:
-the total stays at 3\,KB + 60 bits (Table~\ref{tab:t2b-storage}). Nothing
+\texttt{update\_replacement\_state()}, so they need \textbf{no extra storage}. Nothing
 needs to remember that a line was prefetched; once a demand load hits it, it is
 treated like any other line.
 
@@ -1109,13 +1114,6 @@ Every other cache uses LRU and no other prefetcher is active. Tables and plots
 are produced by \texttt{scripts/task3\_metrics.py}
 (\texttt{results/task3/task3\_metrics.csv}, \texttt{task3\_table.md},
 \texttt{plots/}).
-
-The four configurations come from runs made at different times and on
-different machines. Two equivalent no-prefetching LRU runs (Task 1B baseline
-and Task 2B LRU) differ by up to 0.06\% in IPC and by up to 0.54 L2 instruction
-MPKI (Trace2), so differences of that size are within noise. For the same
-reason Dyn-I-RRIP's speedups here (vs.\ the Task 1B baseline) differ slightly
-from Table~\ref{tab:t2b-results} (vs.\ the Task 2B LRU run).
 
 \subsection{Results}
 
