@@ -1,0 +1,25 @@
+# LaTeX build artifacts (the compiled PDFs are kept)
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.synctex(busy)
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.nav
+*.snm
+*.vrb
+*.xdv
+*.dvi
+*-blx.bib
+
+# Editor backups
+*~
+*.bak
