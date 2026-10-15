@@ -274,11 +274,11 @@ and SPP.}
         busy, so some of its benefit likely shows up as L2 hits that the L1D
         coverage metric does not count, whereas SPP drops prefetches when fewer
         than 3 MSHRs are free.
-  \item \textbf{Why the gains are small.} Coverage is at most 5.8\%: more than
-        94\% of the baseline L1D load misses are not predictable from a per-IP
-        stride or stride sequence in these traces. Since all three traces have a
-        low IPC (0.23--0.38) and the misses that remain dominate execution time,
-        removing a few percent of L1D misses changes the IPC very little.
+%   \item \textbf{Why the gains are small.} Coverage is at most 5.8\%: more than
+%         94\% of the baseline L1D load misses are not predictable from a per-IP
+%         stride or stride sequence in these traces. Since all three traces have a
+%         low IPC (0.23--0.38) and the misses that remain dominate execution time,
+%         removing a few percent of L1D misses changes the IPC very little.
 \end{itemize}
 
 \subsection{Storage overhead}
@@ -1254,14 +1254,14 @@ prefetch-aware Dynamic I-RRIP at the L2.}
         10.281 for SPP with LRU). It also has the lowest L2C load MPKI on Trace1
         and Trace3.
   \item \textbf{SPP behaves the same under the new L2 policy.} L1D accuracy and
-        coverage are unchanged within noise (Table~\ref{tab:t3-pf}), so inserting
-        prefetched lines at RRPV 3 in the L2 does not hurt the prefetcher: what
-        matters to it is the L1D copy.
-  \item \textbf{The prefetch rules do what they are meant to.} The L2 copies of
-        prefetched lines are evicted quickly (1--3\% are reused instead of
-        5--15\%), and the dueling ratio and the time spent in I-RRIP mode stay at
-        the level of Dynamic I-RRIP without a prefetcher
-        (Table~\ref{tab:t3-duel}).
+        coverage remain almost unchanged (Table~\ref{tab:t3-pf}), so inserting
+        prefetched lines at RRPV 3 in the L2 does not seem to hurt the 
+        prefetcher: what matters to it is the L1D copy.
+%   \item \textbf{The prefetch rules do what they are meant to.} The L2 copies of
+%         prefetched lines are evicted quickly (1--3\% are reused instead of
+%         5--15\%), and the dueling ratio and the time spent in I-RRIP mode stay at
+%         the level of Dynamic I-RRIP without a prefetcher
+%         (Table~\ref{tab:t3-duel}).
   \item \textbf{IPC.} The combination has the highest average IPC (0.2903 vs.\
         0.2902 for Dyn-I-RRIP and 0.2891 for SPP) and is the best configuration
         on Trace3 (1.0024). Its geometric-mean speedup (1.0069) is equal to
@@ -1269,13 +1269,13 @@ prefetch-aware Dynamic I-RRIP at the L2.}
         It does \emph{not} beat both standalone mechanisms on every trace: on
         Trace1 it is between them (1.0021 vs.\ SPP's 1.0042), and on Trace2 it is
         0.6\% behind Dynamic I-RRIP (1.0163 vs.\ 1.0224).
-  \item \textbf{Trace2.} The combination has 1.6 more L2 instruction MPKI than
-        Dynamic I-RRIP alone (14.22 vs.\ 12.63). Up to about 0.5 MPKI of that is
-        run-to-run difference between the two setups (see the setup above); the
-        rest means prefetches still cost some code lines even at RRPV 3. A likely
-        cause is the victim search: when a prefetch fill finds no line at RRPV 3,
-        every line in the set is aged, including instruction lines, which brings
-        them closer to eviction.
+%   \item \textbf{Trace2.} The combination has 1.6 more L2 instruction MPKI than
+%         Dynamic I-RRIP alone (14.22 vs.\ 12.63). Up to about 0.5 MPKI of that is
+%         run-to-run difference between the two setups (see the setup above); the
+%         rest means prefetches still cost some code lines even at RRPV 3. A likely
+%         cause is the victim search: when a prefetch fill finds no line at RRPV 3,
+%         every line in the set is aged, including instruction lines, which brings
+%         them closer to eviction.
 \end{itemize}
 
 \end{document}
