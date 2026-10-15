@@ -5,90 +5,253 @@
 #define NUM_IP_ENTRIES 24
 #define NUM_PATTERNS 24
 #define HISTORY_LEN 8
-typedef uint64_t ip_t;
 
-struct Vector_Hash{
-    size_t operator()(const vector<int64_t> &vec) const {
+#define NO_CONF 0
+#define MID_CONF 1
+#define HIGH_CONF 2
+
+#define ACC_HIGH 0.6
+#define ACC_LOW 0.3
+#define MAX_DEGREE 8
+#define MIN_DEGREE 1
+#define EPOCH_LEN 256
+#define MASK_IP 0xFF
+
+// only the low 8 bits of the IP are stored (see MASK_IP)
+typedef uint8_t ip_t;
+
+// strides are stored in cache lines; only strides in [-128, 127] are tracked
+typedef int8_t stride_t;
+
+struct Vector_Hash {
+    size_t operator()(const vector<stride_t> &vec) const {
         size_t h = vec.size();
-        for(int64_t x:vec)
-            h ^= std::hash<int64_t>{}(x)  + 0x9e3779b9 + (h<<6) +(h>>2);
+        for (stride_t x : vec)
+            h ^= std::hash<stride_t>{}(x) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
 
-struct IP_P_Entry{
-    int64_t next_stride;
-    int64_t confidence;
-};
-
-struct IP_Entry{
-    uint64_t last_addr;
-    vector <int64_t> last_strides;
-    uint8_t confidence;
+struct IP_P_Entry {
+    stride_t next_stride;
+    int8_t confidence;
     uint8_t LRU;
-    int64_t modified_stride;
 
-
-    unordered_map <vector<int64_t>, IP_P_Entry, Vector_Hash> patterns;
-
-    IP_Entry(uint64_t addr){
-        last_strides.assign(HISTORY_LEN,0);
-        this-> LRU = 0;
-        this-> confidence = 0;
-        this-> modified_stride=0;
-        this-> last_addr = addr;
+    IP_P_Entry(stride_t stride) {
+        next_stride = stride;
+        confidence = 0;
+        LRU = 0;
     }
 };
 
-unordered_map<ip_t,IP_Entry> IP_Table;
+struct IP_Entry {
+    uint64_t last_addr;
+    vector<stride_t> last_strides;
+    uint8_t confidence;
+    uint8_t LRU;
+    stride_t monitored_stride;
 
-void evict_lru_ip(){
-    if (IP_Table.size() < NUM_IP_ENTRIES)
+    unordered_map<vector<stride_t>, IP_P_Entry, Vector_Hash> patterns;
+
+    IP_Entry(uint64_t addr) {
+        last_strides.assign(HISTORY_LEN, 0);
+        this->LRU = 0;
+        this->confidence = 0;
+        this->monitored_stride = 0;
+        this->last_addr = addr;
+    }
+};
+
+unordered_map<ip_t, IP_Entry> g_ip_table;
+int g_prefetch_degree = 1;
+uint64_t g_epoch_accesses = 0;
+uint64_t g_last_issued = 0, g_last_useful = 0;
+
+void evict_lru_ip() {
+    if (g_ip_table.size() < NUM_IP_ENTRIES)
         return;
 
-    auto victim = IP_Table.begin();
-    for (auto it = IP_Table.begin(); it != IP_Table.end(); ++it) {
+    auto victim = g_ip_table.begin();
+    for (auto it = g_ip_table.begin(); it != g_ip_table.end(); ++it) {
         if (it->second.LRU > victim->second.LRU)
             victim = it;
     }
-    IP_Table.erase(victim);
+    g_ip_table.erase(victim);
 }
 
-void CACHE::l1d_prefetcher_initialize() 
-{
+void evict_least_confident_pattern(IP_Entry &entry) {
+    auto &the_map = entry.patterns;
+    if (the_map.size() < NUM_PATTERNS)
+        return;
+
+    auto it = the_map.begin();
+    int64_t min_score = INT64_MAX;
+    auto to_delete = it;
+    for (; it != the_map.end(); it++) {
+        if (it->second.confidence - it->second.LRU < min_score) {
+            min_score = it->second.confidence - it->second.LRU;
+            to_delete = it;
+        }
+    }
+    the_map.erase(to_delete);
+}
+
+int64_t calculate_stride(uint64_t curr_addr, uint64_t last_addr) {
+    if (curr_addr > last_addr)
+        return (int64_t)(curr_addr - last_addr);
+    else
+        return -1 * (int64_t)(last_addr - curr_addr);
+}
+
+void adjust_prefetch_degree(uint64_t pf_issued, uint64_t pf_useful) {
+    if (++g_epoch_accesses < EPOCH_LEN)
+        return;
+    g_epoch_accesses = 0;
+
+    uint64_t issued = pf_issued - g_last_issued;
+    uint64_t useful = pf_useful - g_last_useful;
+    g_last_issued = pf_issued;
+    g_last_useful = pf_useful;
+
+    if (issued == 0)
+        return; // nothing to judge this epoch
+
+    double accuracy = (double)useful / issued;
+    if (accuracy > ACC_HIGH && g_prefetch_degree < MAX_DEGREE)
+        g_prefetch_degree++;
+    else if (accuracy < ACC_LOW && g_prefetch_degree > MIN_DEGREE)
+        g_prefetch_degree--;
+}
+
+vector<uint64_t> find_prefetch_targets(IP_Entry &entry, uint64_t cl_addr, int degree) {
+    vector<stride_t> strides = entry.last_strides;
+    vector<uint64_t> result;
+    for (int i = 0; i < degree; i++) {
+        auto it = entry.patterns.find(strides);
+        if (it == entry.patterns.end())
+            break;
+        stride_t nxt = it->second.next_stride;
+        strides.erase(strides.begin());
+        strides.push_back(nxt);
+        result.push_back(cl_addr += nxt);
+    }
+    return result;
+}
+
+void increase_ip_lru(unordered_map<ip_t, IP_Entry>::iterator except) {
+    for (auto it = g_ip_table.begin(); it != g_ip_table.end(); it++) {
+        if (it != except) {
+            if (it->second.LRU != UINT8_MAX)
+                it->second.LRU++;
+        } else {
+            it->second.LRU = 0;
+        }
+    }
+}
+
+void increase_pattern_lru(IP_Entry &entry, unordered_map<vector<stride_t>, IP_P_Entry, Vector_Hash>::iterator except) {
+    for (auto it = entry.patterns.begin(); it != entry.patterns.end(); it++) {
+        if (it != except) {
+            if (it->second.LRU != UINT8_MAX)
+                it->second.LRU++;
+        } else
+            it->second.LRU = 0;
+    }
+}
+
+void CACHE::l1d_prefetcher_initialize() {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag) {
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    ip_t masked_ip = ip & MASK_IP;
 
-   auto it=IP_Table.find(ip);
-   if(it == IP_Table.end()){
-    evict_lru_ip();
-    IP_Table.emplace(ip,IP_Entry(cl_addr));
-   }
-   else{
-    IP_Entry &entry = it->second;
-    int64_t stride = (int64_t)cl_addr - (int64_t)entry.last_addr;
+    auto it = g_ip_table.find(masked_ip);
+    if (it == g_ip_table.end()) {
+        evict_lru_ip();
+        g_ip_table.emplace(masked_ip, IP_Entry(cl_addr));
+    } else {
+        IP_Entry &entry = it->second;
+        int64_t stride = calculate_stride(cl_addr, entry.last_addr);
 
-    if (stride == entry.last_strides.back() && entry.confidence < UINT8_MAX)
-        entry.confidence++;
+        if (stride == 0)
+            return;
+        increase_ip_lru(it);
 
-    entry.last_strides.erase(entry.last_strides.begin());
-    entry.last_strides.push_back(stride);
-    entry.last_addr = cl_addr;
-   }
+        // Strides that don't fit in a stride_t can't be stored: count it as a
+        // constant stride mismatch, restart the stride history and skip prefetching
+        if (stride < INT8_MIN || stride > INT8_MAX) {
+            if (entry.confidence > NO_CONF)
+                entry.confidence--;
+            entry.last_strides.assign(HISTORY_LEN, 0);
+            entry.last_addr = cl_addr;
+            adjust_prefetch_degree(pf_lower_level, pf_useful);
+            return;
+        }
+
+        // Train the constant stride prefetcher
+        if (stride == entry.monitored_stride) {
+            if (entry.confidence < HIGH_CONF)
+                entry.confidence++;
+        } else if (entry.confidence > NO_CONF)
+            entry.confidence--;
+        else
+            entry.monitored_stride = (stride_t)stride;
+
+        // Train the variable stride prefetcher
+        auto itp = entry.patterns.find(entry.last_strides);
+        if (itp == entry.patterns.end()) {
+            evict_least_confident_pattern(entry);
+            entry.patterns.emplace(entry.last_strides, IP_P_Entry((stride_t)stride));
+        } else {
+            increase_pattern_lru(entry, itp);
+            if (itp->second.next_stride == stride) {
+                if (itp->second.confidence < INT8_MAX)
+                    itp->second.confidence++;
+            } else {
+                if (itp->second.confidence > 0)
+                    itp->second.confidence = itp->second.confidence / 2;
+                else {
+                    itp->second.confidence = 0;
+                    itp->second.next_stride = (stride_t)stride;
+                }
+            }
+        }
+
+        entry.last_strides.erase(entry.last_strides.begin());
+        entry.last_strides.push_back((stride_t)stride);
+        entry.last_addr = cl_addr;
+        adjust_prefetch_degree(pf_lower_level, pf_useful);
+
+        if (it->second.confidence == HIGH_CONF) {
+            // Prefetch using the constant stride data
+            for (int d = 1; d <= g_prefetch_degree; d++) {
+                uint64_t tgt = (cl_addr + d * entry.monitored_stride) << LOG2_BLOCK_SIZE;
+                if ((tgt >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+                if (MSHR.occupancy < MSHR.SIZE - 2)
+                    prefetch_line(ip, addr, tgt, FILL_L1, 0);
+            }
+        } else {
+            // Prefetch using variable stride data
+            vector<uint64_t> tgts = find_prefetch_targets(entry, cl_addr, g_prefetch_degree);
+            for (auto it = tgts.begin(); it != tgts.end(); it++) {
+                uint64_t tgt = (*it) << LOG2_BLOCK_SIZE;
+                if ((tgt >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    continue;
+                if (MSHR.occupancy < MSHR.SIZE - 2)
+                    prefetch_line(ip, addr, tgt, FILL_L1, 0);
+            }
+        }
+    }
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
-{
-	return; //metadata_in;
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in) {
+    return; // metadata_in;
 }
 
-void CACHE::l1d_prefetcher_final_stats()
-{
-
+void CACHE::l1d_prefetcher_final_stats() {
 }
