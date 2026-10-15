@@ -19,17 +19,18 @@
 \centering
 \small
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{llrrr}
+\begin{tabular}{lp{0.28\linewidth}rrr}
 \toprule
 Task & Mechanism (baseline) & Avg.\ speedup & Best trace & Key metric\\
 \midrule
-1B & SPP at L1D (no prefetching) & 1.0024 & Trace1: 1.0042 & accuracy 50.5\% (IP-stride 35.7\%)\\
+1B & SPP at L1D (no PF) & 1.0024 & Trace1: 1.0042 & accuracy 50.5\% (IP-stride 35.7\%)\\
 2A & I-RRIP at L2 (LRU) & 1.0079 & Trace2: 1.0241 & Trace2 L2 instr.\ MPKI $-35.3\%$\\
 2B & Dynamic I-RRIP at L2 (LRU) & 1.0068 & Trace2: 1.0223 & Trace2 L2 instr.\ MPKI $-33.0\%$\\
+3 & SPP + PF-aware Dyn-I-RRIP (no PF) & 1.0069 & Trace2: 1.0163 & avg.\ IPC 0.2903\\
 \bottomrule
 \end{tabular}
-\caption{Headline results. Average speedups are geometric means over the three
-traces.}
+\caption{Headline results (baseline in parentheses; PF = L1D prefetching).
+Average speedups are geometric means over the three traces.}
 \label{tab:summary}
 \end{table}
 
@@ -47,6 +48,13 @@ traces.}
         keeps about 87\% of the I-RRIP gain while being able to fall back to
         SRRIP. The result is insensitive to the threshold and the number of
         leaders. Storage: 3\,KB + 60 bits.
+  \item \textbf{Task 3 (SPP + prefetch-aware Dynamic I-RRIP):} prefetched
+        lines are inserted into the L2 at RRPV 3, prefetch hits are not
+        promoted and prefetches are not counted by the leader sets. The
+        combination keeps SPP's L1D gains and most of Dynamic I-RRIP's L2
+        instruction-miss reduction, and has the highest average IPC, but its
+        speedup only matches Dynamic I-RRIP's and it does not beat both
+        standalone mechanisms on every trace. No extra storage.
 \end{itemize}
 
 \section*{Experimental setup}
@@ -59,6 +67,9 @@ Trace3-002). Each experiment changes only the mechanism under study:
   \item \textbf{Task 2}: only the L2 replacement policy changes; all
         prefetchers are off and every other cache uses LRU. Baseline: LRU at the
         L2 (1024 sets $\times$ 8 ways, 512\,KB).
+  \item \textbf{Task 3}: SPP at the L1D together with prefetch-aware Dynamic
+        I-RRIP at the L2; every other cache uses LRU. Baseline: no L1D
+        prefetching with LRU at the L2 (the Task 1B baseline).
 \end{itemize}
 Metrics:
 \begin{itemize}
@@ -76,11 +87,12 @@ Metrics:
         $= \dfrac{\text{L1D load misses (baseline)} - \text{L1D load misses (prefetcher)}}
                  {\text{L1D load misses (baseline)}}$.
 \end{itemize}
-The raw outputs are in \texttt{results/task1b}, \texttt{results/task2a} and
-\texttt{results/task2b}. Task 1 tables and plots were produced by
+The raw outputs are in \texttt{results/task1b}, \texttt{results/task2a},
+\texttt{results/task2b} and \texttt{results/task3}. Task 1 tables and plots were produced by
 \texttt{scripts/task1b\_metrics.py}; Task 2 tables and plots by
 \texttt{scripts/parse\_results.py}, \texttt{scripts/plot\_results.py} and
-\texttt{scripts/plot\_task2b.py}.
+\texttt{scripts/plot\_task2b.py}; Task 3 tables and plots by
+\texttt{scripts/task3\_metrics.py}.
 
 %======================================================================
 \section{Task 1A: IP-stride prefetcher}
@@ -1003,5 +1015,269 @@ Follower mode bit (I-RRIP / SRRIP) & 1 bit\\
 \caption{Storage needed by Dynamic I-RRIP.}
 \label{tab:t2b-storage}
 \end{table}
+
+%======================================================================
+\section{Task 3: SPP with Prefetch-Aware Dynamic I-RRIP}
+
+Policy file: \texttt{replacement/dyn\_irrip.l2c\_repl} (SPP at the L1D,
+\texttt{prefetcher/spp.l1d\_pref}, unchanged from Task 1B).
+
+\subsection{Design}
+SPP issues its prefetches with \texttt{FILL\_L1}. A prefetch that misses in the
+L2 is fetched from the LLC/DRAM and filled into \emph{both} the L2 and the L1D.
+The L2 replacement policy sees these requests with \texttt{type == PREFETCH}.
+Task 3 adds one rule set for them to Dynamic I-RRIP. It is applied in every set
+(leader and follower) and in both follower modes, before any other rule:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{0.27\linewidth}p{0.3\linewidth}p{0.33\linewidth}}
+\toprule
+Event & Dynamic I-RRIP (Task 2B) & Prefetch-aware Dynamic I-RRIP\\
+\midrule
+Prefetch fill (miss in L2) & inserted like a data line (RRPV 2) & RRPV 3\\
+Prefetch hit in L2 & promoted like a data hit (RRPV 0 or 1) & RRPV unchanged\\
+Prefetch in a leader set & counted in the dueling ratio & not counted\\
+Demand hit on a prefetched line & -- & promoted as usual (code 0 / data 1 or 0)\\
+\bottomrule
+\end{tabular}
+\caption{Prefetch handling added to Dynamic I-RRIP.}
+\label{tab:t3-rules}
+\end{table}
+
+The rules only use the request type that the cache already passes to
+\texttt{update\_replacement\_state()}, so they need \textbf{no extra storage}:
+the total stays at 3\,KB + 60 bits (Table~\ref{tab:t2b-storage}). Nothing
+needs to remember that a line was prefetched; once a demand load hits it, it is
+treated like any other line.
+
+\subsection{Rationale for handling prefetch packets}
+
+\paragraph{The L2 copy of a prefetched line is rarely used.}
+The L1D copy serves the program; the L2 copy is only read if the line is
+evicted from the L1D and then requested again while still in the L2. With SPP
+and LRU at the L2, only 7.4\%, 15.1\% and 5.0\% of the lines that SPP filled
+into the L2 were ever hit by a demand load (Table~\ref{tab:t3-pf}). Under
+Dynamic I-RRIP such a line would be inserted at RRPV 2 like demand data and,
+on a hit by a later prefetch, promoted like reused data. It would then occupy
+an L2 way for a long time and push out instruction lines, which is exactly
+what I-RRIP tries to prevent.
+
+\paragraph{Insertion at RRPV 3.}
+A prefetched line is a data line already at the maximum RRPV, so it is the
+first victim of the data-first eviction rule in I-RRIP mode and of the
+first-at-RRPV-3 rule in SRRIP mode. It is evicted before any instruction line
+and before demand data that has not aged yet. If the program does read it from
+the L2, the demand hit promotes it normally, so a useful prefetch is not lost.
+The measured cost is small: the share of L2 prefetch fills used by a demand
+load falls to 1.0\%, 3.2\% and 1.2\%, i.e.\ about 1300, 250 and 350 fewer L2
+hits per 25M instructions (at most 0.05 MPKI).
+
+\paragraph{No promotion on a prefetch hit.}
+A prefetch that hits in the L2 means the L1D is about to receive a copy of the
+line. That is not a use by the program, and after it the program reads the
+line from the L1D, not from the L2. Promoting the L2 copy would protect it
+exactly while it is least needed. Only demand hits (and, as in Task 2A, not
+writebacks) count as reuse.
+
+\paragraph{Prefetches are not counted by the leader sets.}
+The dueling ratio measures how much of the program's L2 demand traffic is
+instruction traffic. Every SPP prefetch is a data request
+(\texttt{L2C INSTRUCTION PREFETCH MPKI} is 0), and most of them miss in the
+L2, so counting them would add to the denominator twice and lower the ratio
+just because the prefetcher is active. On Trace3, whose ratio (0.35) is the
+closest to the 0.25 threshold, the 9910 prefetches (9590 misses) would add
+about 9\% to the denominator (131k L2 load accesses + 91k misses) and pull the
+ratio towards the threshold. With prefetches excluded, the leaders measure
+nearly the same ratio as Dynamic I-RRIP without a prefetcher
+(Table~\ref{tab:t3-duel}), so the mode decision keeps reflecting code demand.
+Writebacks are excluded for the same reason.
+
+\subsection{Experimental setup}
+Four configurations are compared on each trace:
+\begin{itemize}
+  \item \textbf{No prefetching (LRU)}: the Task 1B baseline; all speedups are
+        relative to this run.
+  \item \textbf{SPP (LRU)}: SPP at the L1D, LRU at the L2 (Task 1B).
+  \item \textbf{Dyn-I-RRIP}: no prefetcher, Dynamic I-RRIP at the L2 (Task 2B).
+  \item \textbf{SPP + PF-aware Dyn-I-RRIP}: SPP at the L1D, prefetch-aware
+        Dynamic I-RRIP at the L2 (Task 3; threshold 0.25, 32 leaders, window
+        1024).
+\end{itemize}
+Every other cache uses LRU and no other prefetcher is active. Tables and plots
+are produced by \texttt{scripts/task3\_metrics.py}
+(\texttt{results/task3/task3\_metrics.csv}, \texttt{task3\_table.md},
+\texttt{plots/}).
+
+The four configurations come from runs made at different times and on
+different machines. Two equivalent no-prefetching LRU runs (Task 1B baseline
+and Task 2B LRU) differ by up to 0.06\% in IPC and by up to 0.54 L2 instruction
+MPKI (Trace2), so differences of that size are within noise. For the same
+reason Dyn-I-RRIP's speedups here (vs.\ the Task 1B baseline) differ slightly
+from Table~\ref{tab:t2b-results} (vs.\ the Task 2B LRU run).
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l rrrr rrr}
+\toprule
+& \multicolumn{4}{c}{IPC} & \multicolumn{3}{c}{Speedup over no prefetching (LRU)}\\
+\cmidrule(lr){2-5}\cmidrule(lr){6-8}
+Trace & No PF & SPP & Dyn-I-RRIP & SPP + PF-aware & SPP & Dyn-I-RRIP & SPP + PF-aware\\
+\midrule
+Trace1 & 0.2322 & \textbf{0.2332} & 0.2321 & 0.2327 & \textbf{1.0042} & 0.9997 & 1.0021\\
+Trace2 & 0.2511 & 0.2513 & \textbf{0.2568} & 0.2552 & 1.0008 & \textbf{1.0224} & 1.0163\\
+Trace3 & 0.3821 & 0.3829 & 0.3818 & \textbf{0.3830} & 1.0023 & 0.9993 & \textbf{1.0024}\\
+\midrule
+Average & 0.2885 & 0.2891 & 0.2902 & \textbf{0.2903} & 1.0024 & \textbf{1.0071} & 1.0069\\
+\bottomrule
+\end{tabular}
+\caption{Task 3: IPC and speedup (Average: arithmetic mean for IPC, geometric
+mean for speedup). Best value per row in bold.}
+\label{tab:t3-ipc}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Trace & Configuration & L1D load & L2C load & L2 instr. & L2 data\\
+      &               & MPKI     & MPKI     & MPKI      & MPKI\\
+\midrule
+Trace1 & No prefetching (LRU)      & 10.679 & 17.730 & 10.384 & 7.346\\
+       & SPP (LRU)                 & 10.062 & 17.214 & 10.389 & 6.825\\
+       & Dyn-I-RRIP                & 10.680 & 17.651 &  9.788 & 7.864\\
+       & SPP + PF-aware Dyn-I-RRIP & 10.072 & 17.172 &  9.848 & 7.323\\
+\midrule
+Trace2 & No prefetching (LRU)      & 13.534 & 27.923 & 19.391 & 8.533\\
+       & SPP (LRU)                 & 13.446 & 27.827 & 19.326 & 8.500\\
+       & Dyn-I-RRIP                & 13.541 & 21.724 & 12.631 & 9.093\\
+       & SPP + PF-aware Dyn-I-RRIP & 13.457 & 23.206 & 14.218 & 8.988\\
+\midrule
+Trace3 & No prefetching (LRU)      &  3.403 &  3.959 &  1.126 & 2.833\\
+       & SPP (LRU)                 &  3.285 &  3.703 &  1.129 & 2.574\\
+       & Dyn-I-RRIP                &  3.403 &  3.931 &  1.064 & 2.868\\
+       & SPP + PF-aware Dyn-I-RRIP &  3.277 &  3.649 &  1.053 & 2.595\\
+\midrule
+Average & No prefetching (LRU)      & 9.205 & 16.538 & 10.300 & 6.237\\
+        & SPP (LRU)                 & 8.931 & 16.248 & 10.281 & 5.967\\
+        & Dyn-I-RRIP                & 9.208 & 14.436 &  7.827 & 6.608\\
+        & SPP + PF-aware Dyn-I-RRIP & 8.935 & 14.675 &  8.373 & 6.302\\
+\bottomrule
+\end{tabular}
+\caption{Task 3: load MPKI of the L1D, the L2C, and L2 instruction and data
+loads.}
+\label{tab:t3-mpki}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll rrrr rrr}
+\toprule
+& & \multicolumn{4}{c}{L1D} & \multicolumn{3}{c}{L2 copies of prefetched lines}\\
+\cmidrule(lr){3-6}\cmidrule(lr){7-9}
+Trace & Configuration & Accuracy & Coverage & PF issued & PF useful & Fills & Demand hits & \% used\\
+\midrule
+Trace1 & SPP (LRU)       & 60.72\% & 5.78\% & 28454 & 17278 & 20484 & 1513 &  7.39\\
+       & SPP + PF-aware  & 60.94\% & 5.69\% & 27752 & 16913 & 21985 &  221 &  1.01\\
+\midrule
+Trace2 & SPP (LRU)       & 57.47\% & 0.65\% &  5211 &  2995 &  2279 &  345 & 15.14\\
+       & SPP + PF-aware  & 56.67\% & 0.57\% &  5394 &  3057 &  2890 &   93 &  3.22\\
+\midrule
+Trace3 & SPP (LRU)       & 33.36\% & 3.48\% &  9496 &  3168 &  9112 &  455 &  4.99\\
+       & SPP + PF-aware  & 33.73\% & 3.70\% &  9910 &  3343 &  9590 &  110 &  1.15\\
+\midrule
+Average & SPP (LRU)      & 50.52\% & 3.30\% & & & & & \\
+        & SPP + PF-aware & 50.45\% & 3.32\% & & & & & \\
+\bottomrule
+\end{tabular}
+\caption{Task 3: L1D prefetch accuracy and coverage, and what happens to the
+L2 copies of prefetched lines (fills = prefetches that missed in the L2;
+demand hits = those L2 lines later hit by a demand load). ``SPP + PF-aware'' =
+SPP + prefetch-aware Dyn-I-RRIP.}
+\label{tab:t3-pf}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{l rr rr rr}
+\toprule
+& \multicolumn{2}{c}{Average ratio} & \multicolumn{2}{c}{\% in I-RRIP mode} & \multicolumn{2}{c}{Mode switches}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Trace & Dyn & SPP + Dyn & Dyn & SPP + Dyn & Dyn & SPP + Dyn\\
+\midrule
+Trace1 & 0.439 & 0.445 & 100.0 & 100.0 & 0 & 0\\
+Trace2 & 0.600 & 0.634 &  93.7 &  95.8 & 2 & 2\\
+Trace3 & 0.308 & 0.350 &  57.5 &  63.8 & 1 & 1\\
+\bottomrule
+\end{tabular}
+\caption{Set-dueling decision of Dynamic I-RRIP without a prefetcher (Dyn) and with SPP and the prefetch rules (SPP + Dyn). ``\% in I-RRIP mode'' = share of follower accesses served in I-RRIP mode.}
+\label{tab:t3-duel}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.49\linewidth]{task3/plots/speedup.png}\hfill
+\includegraphics[width=0.49\linewidth]{task3/plots/ipc.png}
+\caption{Task 3: speedup over no prefetching with LRU (dashed line) and IPC.}
+\label{fig:t3-speedup}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.49\linewidth]{task3/plots/accuracy.png}\hfill
+\includegraphics[width=0.49\linewidth]{task3/plots/coverage.png}
+\caption{Task 3: L1D prefetch accuracy and coverage of SPP with LRU and with
+prefetch-aware Dynamic I-RRIP at the L2.}
+\label{fig:t3-pf}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{task3/plots/mpki.png}
+\caption{Task 3: L1D, L2C, L2 instruction and L2 data load MPKI.}
+\label{fig:t3-mpki}
+\end{figure}
+
+\subsection{Observations}
+\begin{itemize}
+  \item \textbf{The two mechanisms combine on the misses they target.} The
+        combination keeps SPP's L1D benefit (L1D load MPKI 8.935 vs.\ 8.931 for
+        SPP alone; same accuracy and coverage within 1\%) and most of Dynamic
+        I-RRIP's L2 instruction benefit (average L2 instruction MPKI 8.373 vs.\
+        10.281 for SPP with LRU). It also has the lowest L2C load MPKI on Trace1
+        and Trace3.
+  \item \textbf{SPP behaves the same under the new L2 policy.} L1D accuracy and
+        coverage are unchanged within noise (Table~\ref{tab:t3-pf}), so inserting
+        prefetched lines at RRPV 3 in the L2 does not hurt the prefetcher: what
+        matters to it is the L1D copy.
+  \item \textbf{The prefetch rules do what they are meant to.} The L2 copies of
+        prefetched lines are evicted quickly (1--3\% are reused instead of
+        5--15\%), and the dueling ratio and the time spent in I-RRIP mode stay at
+        the level of Dynamic I-RRIP without a prefetcher
+        (Table~\ref{tab:t3-duel}).
+  \item \textbf{IPC.} The combination has the highest average IPC (0.2903 vs.\
+        0.2902 for Dyn-I-RRIP and 0.2891 for SPP) and is the best configuration
+        on Trace3 (1.0024). Its geometric-mean speedup (1.0069) is equal to
+        Dynamic I-RRIP's (1.0071) within noise and well above SPP's (1.0024).
+        It does \emph{not} beat both standalone mechanisms on every trace: on
+        Trace1 it is between them (1.0021 vs.\ SPP's 1.0042), and on Trace2 it is
+        0.6\% behind Dynamic I-RRIP (1.0163 vs.\ 1.0224).
+  \item \textbf{Trace2.} The combination has 1.6 more L2 instruction MPKI than
+        Dynamic I-RRIP alone (14.22 vs.\ 12.63). Up to about 0.5 MPKI of that is
+        run-to-run difference between the two setups (see the setup above); the
+        rest means prefetches still cost some code lines even at RRPV 3. A likely
+        cause is the victim search: when a prefetch fill finds no line at RRPV 3,
+        every line in the set is aged, including instruction lines, which brings
+        them closer to eviction.
+\end{itemize}
 
 \end{document}
