@@ -8,6 +8,16 @@
 //   follower sets : I-RRIP if ratio > THRESHOLD, else SRRIP
 //   after a decision the counters are halved, so old behaviour fades out
 //
+// PREFETCH AWARENESS (Task 3), in every set and both modes:
+//   An L1D prefetch that misses in L2 fills the line into L2 as well as L1D.
+//   The L1D copy serves the program, so the L2 copy is almost never used
+//   (~5% on Trace1). Such lines must not push out instruction lines:
+//   prefetch fill -> RRPV 3 (first to be evicted unless the program uses it)
+//   prefetch hit  -> no change (a prefetch is not a use by the program)
+//   prefetches are not counted by the leader sets (like writebacks)
+//   A demand hit on a prefetched line is promoted as usual, so a useful
+//   prefetch stays in the cache.
+//
 // Settings (environment variables): DYN_THRESHOLD (0.25), DYN_LEADERS (32),
 // DYN_WINDOW (1024), e.g.  DYN_THRESHOLD=0.35 ./bin/...-dyn_irrip ...
 
@@ -25,6 +35,9 @@
 #define DATA_INSERT_RRPV  2   // new data line          (same as SRRIP)
 #define INSTR_HIT_RRPV    0   // instruction line hit   (same as SRRIP)
 #define DATA_HIT_RRPV     1   // data line hit          (SRRIP uses 0)
+
+// Prefetch rule (all sets, both modes)
+#define PREFETCH_INSERT_RRPV maxRRPV   // new line brought in by a prefetch
 
 // Set-dueling defaults
 #define DEFAULT_THRESHOLD 0.25
@@ -52,6 +65,7 @@ uint64_t decisions, switches;
 double   ratio_sum;
 uint64_t follower_acc[2];
 uint64_t dyn_inserts[2], dyn_evicts[2];
+uint64_t pf_inserts, pf_hits;   // prefetch fills / prefetches that hit in L2
 
 // Read one setting from the environment; keep the default if it is not set.
 // Stops the simulation if the value is outside min..max (a typo in a script).
@@ -142,6 +156,7 @@ void CACHE::l2c_initialize_replacement()
     follower_acc[0] = follower_acc[1] = 0;
     dyn_inserts[0] = dyn_inserts[1] = 0;
     dyn_evicts[0] = dyn_evicts[1] = 0;
+    pf_inserts = pf_hits = 0;
 }
 
 // find replacement victim (EVICTION)
@@ -188,6 +203,28 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 {
     if ((type == WRITEBACK) && ip)
         assert(0);
+
+    // PREFETCH: same rule in leader and follower sets, in both modes,
+    // and before the leader-set counting, so prefetches never
+    // affect the I-RRIP/SRRIP decision.
+    if (type == PREFETCH) {
+        if (hit) {
+            // The line is already here and is being prefetched into L1D;
+            // that is not a use by the program, so leave its RRPV alone.
+            if (warmup_complete[cpu])
+                pf_hits++;
+        }
+        else {
+            // INSERTION at max RRPV: if the program never asks L2 for this
+            // line, it is the first victim and no instruction line is lost
+            // for it. If the program does ask, the demand hit below
+            // promotes it like any other line.
+            l2_rrpv[set][way] = PREFETCH_INSERT_RRPV;
+            if (warmup_complete[cpu])
+                pf_inserts++;
+        }
+        return;
+    }
 
     // LEADER SET: count, then plain SRRIP
     if (leader[set]) {
@@ -249,5 +286,7 @@ void CACHE::l2c_replacement_final_stats()
     cout << "L2C DYN-IRRIP data lines inserted: " << dyn_inserts[0] << endl;
     cout << "L2C DYN-IRRIP instruction lines evicted: " << dyn_evicts[1] << endl;
     cout << "L2C DYN-IRRIP data lines evicted: " << dyn_evicts[0] << endl;
+    cout << "L2C DYN-IRRIP prefetch lines inserted at max RRPV: " << pf_inserts << endl;
+    cout << "L2C DYN-IRRIP prefetch hits (not promoted): " << pf_hits << endl;
 }
 
